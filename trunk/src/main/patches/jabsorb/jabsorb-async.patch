@@ -1,0 +1,807 @@
+Index: test/src/org/jabsorb/client/async/AsyncSessionUtilTest.java
+===================================================================
+--- test/src/org/jabsorb/client/async/AsyncSessionUtilTest.java	(revision 467)
++++ test/src/org/jabsorb/client/async/AsyncSessionUtilTest.java	(working copy)
+@@ -3,7 +3,10 @@
+  */
+ package org.jabsorb.client.async;
+ 
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
+ 
+ import junit.framework.TestCase;
+ 
+@@ -98,4 +101,61 @@
+ 		final AsyncSession session = new DummyAsyncSession(1000, "testUnwrapSession");
+ 		assertSame(session, AsyncSessionUtil.toAsyncSession(AsyncSessionUtil.toSyncSession(session)));
+ 	}
++
++	public void testSyncSessionSendAndReceiveException() throws InterruptedException, TimeoutException {
++		final String exceptionMessage = "Exception in sendAndReceive";
++		final Session session = new Session() {
++
++			public JSONObject sendAndReceive(final JSONObject message) {
++				try {
++					Thread.sleep(1000);
++				} catch (final InterruptedException e) {
++					// shouldn't happen
++					throw new RuntimeException(e);
++				}
++				throw new RuntimeException(exceptionMessage);
++			}
++
++			public void close() {}
++		};
++
++		final AsyncSession asyncSession = AsyncSessionUtil.toAsyncSession(session);
++		final Future<JSONObject> result = asyncSession.send(null);
++
++		try {
++			result.get(5, TimeUnit.SECONDS);
++			fail("Should have thrown an ExecutionException");
++		} catch (final ExecutionException e) {
++			assertNotNull(e.getCause());
++			assertEquals(RuntimeException.class, e.getCause().getClass());
++			assertEquals(exceptionMessage, e.getCause().getMessage());
++		}
++	}
++
++	public void testAsyncSessionSendException() {
++		final String exceptionMessage = "Exception in send";
++
++		final AsyncSession asyncSession = new AsyncSession() {
++			public Future<JSONObject> send(final JSONObject request) {
++				throw new RuntimeException(exceptionMessage);
++			}
++
++			public Future<JSONObject> send(final JSONObject request,
++					final AsyncResultCallback<AsyncSession, JSONObject, JSONObject> callback) {
++				throw new RuntimeException(exceptionMessage);
++			}
++
++			public void close() {}
++		};
++
++		final Session session = AsyncSessionUtil.toSyncSession(asyncSession);
++
++		try {
++			session.sendAndReceive(null);
++			fail("Should have thrown RuntimeException");
++		} catch (final RuntimeException e) {
++			assertNull(e.getCause());
++			assertEquals(exceptionMessage, e.getMessage());
++		}
++	}
+ }
+Index: test/src/org/jabsorb/client/async/SettableFutureTest.java
+===================================================================
+--- test/src/org/jabsorb/client/async/SettableFutureTest.java	(revision 467)
++++ test/src/org/jabsorb/client/async/SettableFutureTest.java	(working copy)
+@@ -3,6 +3,7 @@
+  */
+ package org.jabsorb.client.async;
+ 
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+ 
+@@ -55,18 +56,58 @@
+ 		assertTrue("Less than 2 s should have passed", time < 2000);
+ 	}
+ 
+-	private void runThread(final SettableFuture<String> future, final String result, final int sleep) {
+-		new Thread() {
++	/**
++	 * Test to verify exceptions are thrown when get() is called
++	 * @throws Exception
++	 */
++	public void testGetException() throws Exception {
++		final SettableFuture<String> future = new SettableFuture<String>();
++		assertFalse("future should not be already done", future.isDone());
++
++		future.set(new Exception("exception"));
++
++		try {
++			future.get();
++			fail("Should have thrown an ExecutionException");
++		} catch (final ExecutionException e) {
++			assertEquals("exception", e.getCause().getMessage());
++		}
++	}
++
++	public void testGetThreadException() throws Exception {
++		final SettableFuture<String> future = new SettableFuture<String>();
++		assertFalse("future should not be already done", future.isDone());
++
++		// run a thread for 10 seconds
++		final Thread t = runThread(future, "result", 10000);
++
++		// interrupt it after 2 seconds
++		Thread.sleep(2000);
++		t.interrupt();
++
++		try {
++			future.get();
++			fail("Should have thrown an exception");
++		} catch (final ExecutionException e) {
++			assertTrue(e.getCause() instanceof InterruptedException);
++		}
++	}
++
++	private Thread runThread(final SettableFuture<String> future, final String result, final int sleep) {
++		final Thread thread = new Thread() {
+ 			@Override
+ 			public void run() {
+ 				try {
+-					Thread.sleep(1000); // work for a second
++					Thread.sleep(sleep); // work for a second
+ 				} catch (final InterruptedException e) {
+-					throw new RuntimeException(e);
++					future.set(e);
+ 				}
+-				future.set("result");
++				future.set(result);
+ 			}
+-		}.start();
++		};
++		thread.start();
++
++		return thread;
+ 	}
+ 
+ }
+Index: src/org/jabsorb/client/async/SettableFuture.java
+===================================================================
+--- src/org/jabsorb/client/async/SettableFuture.java	(revision 467)
++++ src/org/jabsorb/client/async/SettableFuture.java	(working copy)
+@@ -8,6 +8,9 @@
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+ 
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
+ /**
+  * <p>Simple implementation of Future<T>. When the result of the computation is
+  * set on this object all get operations are notified and return the result. Cancellation is not supported, {@link #cancel(boolean)} always returns false</p>
+@@ -29,8 +32,10 @@
+  *
+  */
+ public class SettableFuture<T> implements Future<T> {
++	private static Logger log = LoggerFactory.getLogger(SettableFuture.class);
+ 
+ 	private T result;
++	private Throwable exception;
+ 	private boolean done;
+ 
+ 	/**
+@@ -38,12 +43,26 @@
+ 	 * @param result the result
+ 	 */
+ 	public synchronized void set(final T result) {
++		log.debug("Result set: %s", result);
++
+ 		this.result = result;
+ 		done = true;
+ 		notifyAll();
+ 	}
+ 
+ 	/**
++	 * Set an exception that has happened while executing
++	 * @param exception the exception
++	 */
++	public synchronized void set(final Throwable exception) {
++		log.debug("Exception set: %s", exception);
++
++		this.exception = exception;
++		done = true;
++		notifyAll();
++	}
++
++	/**
+ 	 * Always returns false, since cancellation is not supported by this implementation
+ 	 */
+ 	public boolean cancel(final boolean mayInterruptIfRunning) {
+@@ -59,15 +78,23 @@
+ 	}
+ 
+ 	public synchronized T get() throws InterruptedException, ExecutionException {
++		log.debug("Getting result (blocks until result is available)");
++
+ 		while (!isDone()) {
+ 			// release monitor (synchronisation lock) and wait for notification
+ 			wait();
+ 		}
+ 
++		if (exception != null) {
++			throw new ExecutionException(exception);
++		}
++
+ 		return result;
+ 	}
+ 
+ 	public synchronized T get(final long timeout, final TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
++		log.debug("Getting result with a timeout of %d %s (blocks until result is available or timeout has expired)", timeout, unit);
++
+ 		long nanos = unit.toNanos(timeout);
+ 
+ 		final long deadline = System.nanoTime() + nanos;
+@@ -78,6 +105,10 @@
+ 		}
+ 
+ 		if (isDone()) {
++			if (exception != null) {
++				throw new ExecutionException(exception);
++			}
++
+ 			return result;
+ 		}
+ 
+Index: src/org/jabsorb/client/async/AsyncSession.java
+===================================================================
+--- src/org/jabsorb/client/async/AsyncSession.java	(revision 467)
++++ src/org/jabsorb/client/async/AsyncSession.java	(working copy)
+@@ -8,13 +8,50 @@
+ import org.json.JSONObject;
+ 
+ /**
++ * Interface that can be implemented by JSON-RPC transports that are
++ * asynchronous in nature, such as XMPP or SMTP. <br>
++ * <br>
++ * <strong>EXCEPTION HANDLING:</strong> <br>
++ * Exceptions that occur before a request is sent should be thrown immediately
++ * as RuntimeExceptions (unless they can be properly recovered from). Exceptions
++ * that occur in a later stadiun, when the message is already sent, or when
++ * handling the response, should be thrown when the returned Future's get()
++ * method is called. To achieve this, {@link SettableFuture#set(Exception)} can
++ * be used. RuntimeExceptions in running Threads can be handled by either
++ * settings that thread instance's
++ * {@link Thread#setUncaughtExceptionHandler(java.lang.Thread.UncaughtExceptionHandler)}
++ * method, or by using the static
++ * {@link Thread#setDefaultUncaughtExceptionHandler(java.lang.Thread.UncaughtExceptionHandler)}
++ * method.
++ *
++ * @see SettableFuture
++ * @see Thread#setUncaughtExceptionHandler(java.lang.Thread.UncaughtExceptionHandler)
++ * @see Thread#setDefaultUncaughtExceptionHandler(java.lang.Thread.UncaughtExceptionHandler)
++ * @see ThreadGroup#uncaughtException(Thread, Throwable)
+  * @author matthijs
+- *
+  */
+ public interface AsyncSession {
++	/**
++	 * Asynchronously send a JSON request
++	 *
++	 * @param request A JSON message to send
++	 * @return a Future object that can be used to poll for the result, or force
++	 *         a blocking call to wait for the result
++	 */
+ 	public Future<JSONObject> send(JSONObject request);
+ 
++	/**
++	 * Asynchronously send a JSON request
++	 *
++	 * @param request A JSON message to send
++	 * @param callback an {@link AsyncResultCallback} object that will be called back when the result becomes available
++	 * @return a Future object that can be used to poll for the result, or force
++	 *         a blocking call to wait for the result
++	 */
+ 	public Future<JSONObject> send(JSONObject request, AsyncResultCallback<AsyncSession, JSONObject, JSONObject> callback);
+ 
++	/**
++	 * Close the session and release the resources if necessary
++	 */
+ 	public void close();
+ }
+Index: src/org/jabsorb/client/async/UncaughtThreadExceptionHandler.java
+===================================================================
+--- src/org/jabsorb/client/async/UncaughtThreadExceptionHandler.java	(revision 0)
++++ src/org/jabsorb/client/async/UncaughtThreadExceptionHandler.java	(revision 0)
+@@ -0,0 +1,34 @@
++/**
++ *
++ */
++package org.jabsorb.client.async;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++
++/**
++ * Utility class to use as an UncaughtExceptionHandler for asynchronously running threads
++ * @author matthijs
++ *
++ */
++public class UncaughtThreadExceptionHandler implements Thread.UncaughtExceptionHandler {
++	private static Logger log = LoggerFactory.getLogger(UncaughtThreadExceptionHandler.class);
++
++	private final SettableFuture<?> settableFuture;
++
++	/**
++	 * @param settableFuture The SettableFuture instance to set the exception on
++	 */
++	public UncaughtThreadExceptionHandler(final SettableFuture<?> settableFuture) {
++		this.settableFuture = settableFuture;
++	}
++
++
++	public void uncaughtException(final Thread t, final Throwable e) {
++		log.debug("Caught uncaught exception on thread %s: %s", t, e);
++		if (settableFuture != null) {
++			settableFuture.set(e);
++		}
++	}
++}
+
+Property changes on: src/org/jabsorb/client/async/UncaughtThreadExceptionHandler.java
+___________________________________________________________________
+Added: svn:mime-type
+   + text/plain
+
+Index: src/org/jabsorb/client/async/AsyncSessionUtil.java
+===================================================================
+--- src/org/jabsorb/client/async/AsyncSessionUtil.java	(revision 467)
++++ src/org/jabsorb/client/async/AsyncSessionUtil.java	(working copy)
+@@ -36,7 +36,7 @@
+ 		return new AsyncedSyncSession(session);
+ 	}
+ 
+-	private static class SyncedAsyncSession implements Session {
++	protected static class SyncedAsyncSession implements Session {
+ 		private final AsyncSession asyncSession;
+ 
+ 		public SyncedAsyncSession(final AsyncSession asyncSession) {
+@@ -70,7 +70,7 @@
+ 		}
+ 	}
+ 
+-	private static class AsyncedSyncSession implements AsyncSession {
++	protected static class AsyncedSyncSession implements AsyncSession {
+ 		private final Session session;
+ 
+ 		public AsyncedSyncSession(final Session session) {
+@@ -91,7 +91,7 @@
+ 		public Future<JSONObject> send(final JSONObject request, final AsyncResultCallback<AsyncSession, JSONObject, JSONObject> callback) {
+ 			final SettableFuture<JSONObject> result = new SettableFuture<JSONObject>();
+ 
+-			new Thread() {
++			final Thread thread = new Thread(this.toString()) {
+ 				@Override
+ 				public void run() {
+ 					final JSONObject response = session.sendAndReceive(request);
+@@ -99,15 +99,14 @@
+ 					result.set(response);
+ 
+ 					if (callback != null) {
+-						try {
+-							callback.onAsyncResult(AsyncedSyncSession.this, result, request);
+-						} catch (final Exception e) {
+-							throw new RuntimeException(e);
+-						}
++						callback.onAsyncResult(AsyncedSyncSession.this, result, request);
+ 					}
+ 				}
+-			}.start();
++			};
+ 
++			thread.setUncaughtExceptionHandler(new UncaughtThreadExceptionHandler(result));
++			thread.start();
++
+ 			return result;
+ 		}
+ 
+Index: src/org/jabsorb/client/async/AsyncProxyHandler.java
+===================================================================
+--- src/org/jabsorb/client/async/AsyncProxyHandler.java	(revision 467)
++++ src/org/jabsorb/client/async/AsyncProxyHandler.java	(working copy)
+@@ -6,10 +6,7 @@
+ import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.Method;
+ import java.util.UUID;
+-import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.TimeoutException;
+ 
+ import org.jabsorb.JSONSerializer;
+ import org.jabsorb.client.ErrorResponse;
+@@ -21,237 +18,202 @@
+ import org.json.JSONObject;
+ 
+ public class AsyncProxyHandler implements InvocationHandler {
+-		// AsyncProxy methods
+-		private static final Method METHOD_GET_FUTURE_RESULT;
+-		private static final Method METHOD_SET_RESULT_CALLBACK;
++	// AsyncProxy methods
++	private static final Method METHOD_GET_FUTURE_RESULT;
++	private static final Method METHOD_SET_RESULT_CALLBACK;
+ 
+-		static {
+-			try {
+-				METHOD_GET_FUTURE_RESULT = AsyncProxy.class.getDeclaredMethod("getFutureResult", new Class<?>[0]);
+-				METHOD_SET_RESULT_CALLBACK = AsyncProxy.class.getDeclaredMethod("setResultCallback", AsyncResultCallback.class);
+-			} catch (final Exception e) {
+-				throw new ExceptionInInitializerError(e);
+-			}
++	static {
++		try {
++			METHOD_GET_FUTURE_RESULT = AsyncProxy.class.getDeclaredMethod("getFutureResult", new Class<?>[0]);
++			METHOD_SET_RESULT_CALLBACK = AsyncProxy.class.getDeclaredMethod("setResultCallback", AsyncResultCallback.class);
++		} catch (final Exception e) {
++			throw new ExceptionInInitializerError(e);
+ 		}
++	}
+ 
+-		private final String proxyKey;
+-		private final AsyncSession session;
+-		private final JSONSerializer serializer;
++	private final String proxyKey;
++	private final AsyncSession session;
++	private final JSONSerializer serializer;
+ 
+-		public AsyncProxyHandler(final String proxyKey, final AsyncSession session, final JSONSerializer serializer) {
+-			this.proxyKey = proxyKey;
+-			this.session = session;
+-			this.serializer = serializer;
+-		}
++	public AsyncProxyHandler(final String proxyKey, final AsyncSession session, final JSONSerializer serializer) {
++		this.proxyKey = proxyKey;
++		this.session = session;
++		this.serializer = serializer;
++	}
+ 
+-		private Future<Object> futureResult;
++	private Future<Object> futureResult;
+ 
+-		private AsyncResultCallback<Object, Object, Method> resultCallback;
++	private AsyncResultCallback<Object, Object, Method> resultCallback;
+ 
+-		@SuppressWarnings("unchecked")
+-		public Object invoke(final Object proxyObj, final Method method, final Object[] args) throws Exception {
+-			assert (proxyObj instanceof AsyncProxy) : "Proxy object is not created by AsyncClient?";
++	@SuppressWarnings("unchecked")
++	public Object invoke(final Object proxyObj, final Method method, final Object[] args) throws Exception {
++		assert (proxyObj instanceof AsyncProxy) : "Proxy object is not created by AsyncClient?";
+ 
+-			final String methodName = method.getName();
++		final String methodName = method.getName();
+ 
+-			if (methodName.equals("hashCode")) {
+-				return new Integer(System.identityHashCode(proxyObj));
+-			} else if (methodName.equals("equals")) {
+-				return (proxyObj == args[0] ? Boolean.TRUE : Boolean.FALSE);
+-			} else if (methodName.equals("toString")) {
+-				return proxyObj.getClass().getName() + '@'
+-						+ Integer.toHexString(proxyObj.hashCode());
+-			} else if (METHOD_GET_FUTURE_RESULT.equals(method)) {
+-				return futureResult;
+-			} else if (METHOD_SET_RESULT_CALLBACK.equals(method)) {
++		if (methodName.equals("hashCode")) {
++			return new Integer(System.identityHashCode(proxyObj));
++		} else if (methodName.equals("equals")) {
++			return (proxyObj == args[0] ? Boolean.TRUE : Boolean.FALSE);
++		} else if (methodName.equals("toString")) {
++			return proxyObj.getClass().getName() + '@'
++					+ Integer.toHexString(proxyObj.hashCode());
++		} else if (METHOD_GET_FUTURE_RESULT.equals(method)) {
++			return futureResult;
++		} else if (METHOD_SET_RESULT_CALLBACK.equals(method)) {
+ 
+-				setResultCallback((AsyncResultCallback<Object, Object, Method>) args[0]);
+-				return null;
+-			}
+-
+-			return doInvoke(proxyObj, method, args);
++			setResultCallback((AsyncResultCallback<Object, Object, Method>) args[0]);
++			return null;
+ 		}
+ 
+-		/**
+-		 * Invokes a method for the asynchronous client and returns null immediately
+-		 *
+-		 * @param objectTag
+-		 *            (optional) the name of the object to invoke the method on. May
+-		 *            be null.
+-		 * @param method
+-		 *            The method to call.
+-		 * @param args
+-		 *            The arguments to the method.
+-		 * @param returnType
+-		 *            What should be returned
+-		 * @return Always null
+-		 * @throws Exception
+-		 *             JSONObject, UnmarshallExceptions or Exceptions from invoking
+-		 *             the method may be thrown.
+-		 */
+-		private Object doInvoke(final Object proxyObject, final Method method, final Object[] args) throws Exception {
+-			// Create a final reference that can be used when this method
+-			// returns. We don't know if the original callback will still be
+-			// the same.
+-			final AsyncResultCallback<Object, Object, Method> currentCallback = resultCallback;
++		return doInvoke(proxyObj, method, args);
++	}
+ 
+-			final ExceptionSettableFuture<Object> future = new ExceptionSettableFuture<Object>();
+-			setFutureResult(future);
++	/**
++	 * Invokes a method for the asynchronous client and returns null immediately
++	 *
++	 * @param objectTag
++	 *            (optional) the name of the object to invoke the method on. May
++	 *            be null.
++	 * @param method
++	 *            The method to call.
++	 * @param args
++	 *            The arguments to the method.
++	 * @param returnType
++	 *            What should be returned
++	 * @return Always null
++	 * @throws Exception
++	 *             JSONObject, UnmarshallExceptions or Exceptions from invoking
++	 *             the method may be thrown.
++	 */
++	private Object doInvoke(final Object proxyObject, final Method method, final Object[] args) throws Exception {
++		// Create a final reference that can be used when this method
++		// returns. We don't know if the original callback will still be
++		// the same.
++		final AsyncResultCallback<Object, Object, Method> currentCallback = resultCallback;
+ 
+-			final JSONObject message = createInvokeMessage(proxyKey, method.getName(), args);
++		final SettableFuture<Object> future = new SettableFuture<Object>();
++		setFutureResult(future);
+ 
+-			final AsyncResultCallback<AsyncSession, JSONObject, JSONObject> jsonResultCallback = new AsyncResultCallback<AsyncSession, JSONObject, JSONObject>() {
+-				public void onAsyncResult(final AsyncSession source, final Future<JSONObject> response, final JSONObject request) {
+-					// get the response
+-					try {
+-						final JSONObject responseMessage = response.get();
++		final JSONObject message = createInvokeMessage(proxyKey, method.getName(), args);
+ 
+-						// convert the response
+-						final Object resultObject = convertResponseMessage(responseMessage, method.getReturnType());
++		final AsyncResultCallback<AsyncSession, JSONObject, JSONObject> jsonResultCallback = new AsyncResultCallback<AsyncSession, JSONObject, JSONObject>() {
++			public void onAsyncResult(final AsyncSession source, final Future<JSONObject> response, final JSONObject request) {
++				// get the response
++				try {
++					final JSONObject responseMessage = response.get();
+ 
+-						// set the result onto the future that is used
+-						future.set(resultObject);
+-					} catch (final ExecutionException e) {
+-						// deal with exceptions in the future
+-						future.setException(e);
+-					} catch (final Exception e) {
+-						// deal with exceptions in the future
+-						future.setException(new ExecutionException(e));
+-					}
++					// convert the response
++					final Object resultObject = convertResponseMessage(responseMessage, method.getReturnType());
+ 
+-					// call the callback that was set when invoke was called
+-					currentCallback.onAsyncResult(proxyObject, future, method);
++					// set the result onto the future that is used
++					future.set(resultObject);
++				} catch (final Exception e) {
++					// deal with exceptions in the future
++					future.set(e);
+ 				}
+-			};
+ 
+-			// invoke the method by sending the message
+-			session.send(message, jsonResultCallback);
+-
+-			// return null as fast as you can
+-			return null;
+-		}
+-
+-		/**
+-		 * Gets the id of the next message
+-		 *
+-		 * @return The id for the next message.
+-		 */
+-		protected String getId() {
+-			return UUID.randomUUID().toString();
+-		}
+-
+-		/**
+-		 * Generate and throw exception based on the data in the 'responseMessage'
+-		 *
+-		 * @param responseMessage
+-		 *            The error message
+-		 * @throws JSONException
+-		 *             Rethrows the exception in the repsonse.
+-		 */
+-		protected void processException(final JSONObject responseMessage) throws JSONException {
+-			final JSONObject error = (JSONObject) responseMessage.get("error");
+-			if (error != null) {
+-				final Integer code = new Integer(error.has("code") ? error.getInt("code") : 0);
+-				final String trace = error.has("trace") ? error.getString("trace") : null;
+-				final String msg = error.has("msg") ? error.getString("msg") : null;
+-				throw new ErrorResponse(code, msg, trace);
++				// call the callback that was set when invoke was called
++				currentCallback.onAsyncResult(proxyObject, future, method);
+ 			}
+-			throw new ErrorResponse(new Integer(FailedResult.CODE_ERR_PARSE),
+-					"Unknown response:" + responseMessage.toString(2), null);
+-		}
++		};
+ 
+-		protected JSONObject createInvokeMessage(final String objectTag, final String methodName, final Object[] args) throws MarshallException, JSONException {
+-			JSONObject message;
+-			String methodTag = objectTag == null ? "" : objectTag + ".";
+-			methodTag += methodName;
++		// invoke the method by sending the message
++		session.send(message, jsonResultCallback);
+ 
+-			if (args != null) {
+-				final SerializerState state = serializer.createSerializerState();
+-				final Object params = serializer.marshall(state, /* parent */
+-						null, args, JSONSerializer.PARAMETER_FIELD);
++		// return null as fast as you can
++		return null;
++	}
+ 
+-				message = state.createObject(JSONSerializer.PARAMETER_FIELD, params);
+-			} else {
+-				message = new JSONObject();
+-				message.put(JSONSerializer.PARAMETER_FIELD, new JSONArray());
+-			}
++	/**
++	 * Gets the id of the next message
++	 *
++	 * @return The id for the next message.
++	 */
++	protected String getId() {
++		return UUID.randomUUID().toString();
++	}
+ 
+-			message.put(JSONSerializer.METHOD_FIELD, methodTag);
+-			message.put(JSONSerializer.ID_FIELD, getId());
+-
+-			return message;
++	/**
++	 * Generate and throw exception based on the data in the 'responseMessage'
++	 *
++	 * @param responseMessage
++	 *            The error message
++	 * @throws JSONException
++	 *             Rethrows the exception in the repsonse.
++	 */
++	protected void processException(final JSONObject responseMessage) throws JSONException {
++		final JSONObject error = (JSONObject) responseMessage.get("error");
++		if (error != null) {
++			final Integer code = new Integer(error.has("code") ? error.getInt("code") : 0);
++			final String trace = error.has("trace") ? error.getString("trace") : null;
++			final String msg = error.has("msg") ? error.getString("msg") : null;
++			throw new ErrorResponse(code, msg, trace);
+ 		}
++		throw new ErrorResponse(new Integer(FailedResult.CODE_ERR_PARSE),
++				"Unknown response:" + responseMessage.toString(2), null);
++	}
+ 
+-		protected Object convertResponseMessage(final JSONObject responseMessage, final Class<?> returnType) throws Exception {
+-			if (!responseMessage.has(JSONSerializer.RESULT_FIELD)) {
+-				processException(responseMessage);
+-			}
++	protected JSONObject createInvokeMessage(final String objectTag, final String methodName, final Object[] args) throws MarshallException, JSONException {
++		JSONObject message;
++		String methodTag = objectTag == null ? "" : objectTag + ".";
++		methodTag += methodName;
+ 
+-			final Object rawResult = serializer.getRequestParser().unmarshall(responseMessage, JSONSerializer.RESULT_FIELD);
+-
+-			if (returnType.equals(Void.TYPE)) {
+-				return null;
+-			} else if (rawResult == null) {
+-				processException(responseMessage);
+-			}
+-
++		if (args != null) {
+ 			final SerializerState state = serializer.createSerializerState();
+-			final Object toReturn = serializer.unmarshall(state, returnType, rawResult);
++			final Object params = serializer.marshall(state, /* parent */
++					null, args, JSONSerializer.PARAMETER_FIELD);
+ 
+-			return toReturn;
++			message = state.createObject(JSONSerializer.PARAMETER_FIELD, params);
++		} else {
++			message = new JSONObject();
++			message.put(JSONSerializer.PARAMETER_FIELD, new JSONArray());
+ 		}
+ 
+-		/**
+-		 * @param futureResult the futureResult to set
+-		 */
+-		private synchronized void setFutureResult(final Future<Object> futureResult) {
+-			// Synchronize setting the futureResult so that calling a method and
+-			// getting the futureResult in one synchronized block returns the
+-			// futureResult for that call. Other calling threads not holding the
+-			// monitor will have to wait
+-			this.futureResult = futureResult;
+-		}
++		message.put(JSONSerializer.METHOD_FIELD, methodTag);
++		message.put(JSONSerializer.ID_FIELD, getId());
+ 
+-		/**
+-		 * @param resultCallback the resultCallback to set
+-		 */
+-		private synchronized void setResultCallback(final AsyncResultCallback<Object, Object, Method> resultCallback) {
+-			// Synchronize setting the resultCallback so that calling a method and
+-			// setting the resultCallback in one synchronized block set the
+-			// resultCallback for that call. Other calling threads not holding the
+-			// monitor will have to wait
+-			this.resultCallback = resultCallback;
++		return message;
++	}
++
++	protected Object convertResponseMessage(final JSONObject responseMessage, final Class<?> returnType) throws Exception {
++		if (!responseMessage.has(JSONSerializer.RESULT_FIELD)) {
++			processException(responseMessage);
+ 		}
+ 
+-		private static class ExceptionSettableFuture<T> extends SettableFuture<T> {
+-			private ExecutionException exception;
++		final Object rawResult = serializer.getRequestParser().unmarshall(responseMessage, JSONSerializer.RESULT_FIELD);
+ 
+-			@Override
+-			public synchronized T get() throws InterruptedException, ExecutionException {
+-				if (exception != null) {
+-					throw exception;
+-				}
++		if (returnType.equals(Void.TYPE)) {
++			return null;
++		} else if (rawResult == null) {
++			processException(responseMessage);
++		}
+ 
+-				return super.get();
+-			}
++		final SerializerState state = serializer.createSerializerState();
++		final Object toReturn = serializer.unmarshall(state, returnType, rawResult);
+ 
+-			@Override
+-			public T get(final long timeout, final TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+-				if (exception != null) {
+-					throw exception;
+-				}
++		return toReturn;
++	}
+ 
+-				return super.get(timeout, unit);
+-			}
++	/**
++	 * @param futureResult the futureResult to set
++	 */
++	private synchronized void setFutureResult(final Future<Object> futureResult) {
++		// Synchronize setting the futureResult so that calling a method and
++		// getting the futureResult in one synchronized block returns the
++		// futureResult for that call. Other calling threads not holding the
++		// monitor will have to wait
++		this.futureResult = futureResult;
++	}
+ 
+-
+-
+-			/**
+-			 * @param exception the exception to set
+-			 */
+-			public void setException(final ExecutionException exception) {
+-				this.exception = exception;
+-			}
+-
+-		}
+-	}
+\ No newline at end of file
++	/**
++	 * @param resultCallback the resultCallback to set
++	 */
++	private synchronized void setResultCallback(final AsyncResultCallback<Object, Object, Method> resultCallback) {
++		// Synchronize setting the resultCallback so that calling a method and
++		// setting the resultCallback in one synchronized block set the
++		// resultCallback for that call. Other calling threads not holding the
++		// monitor will have to wait
++		this.resultCallback = resultCallback;
++	}
++}
